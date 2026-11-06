@@ -1,6 +1,8 @@
 # cadence
 
-<img width="675" height="433" alt="57_027c7e99-8ca7-4f42-9891-b02656a8beef" src="https://github.com/user-attachments/assets/d7605f8c-a67a-4085-bad1-ff615fb1fb60" />
+<p align="center">
+  <img width="675" height="433" alt="57_027c7e99-8ca7-4f42-9891-b02656a8beef" src="https://github.com/user-attachments/assets/d7605f8c-a67a-4085-bad1-ff615fb1fb60" />
+</p>
 
 A terminal dashboard for Bluetooth LE cycling speed/cadence sensors, written in Rust.
 Built and tested around the **Saris Speed/Cadence** sensor, but it works with any sensor
