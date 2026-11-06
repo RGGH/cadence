@@ -9,11 +9,13 @@ that exposes the standard **Cycling Speed and Cadence Service** (`0x1816`).
 - Session stats: average, max, pedalling time, elapsed time
 - Speed, max speed and distance when the sensor is mounted on the wheel hub
 - Auto-reconnects when the sensor sleeps and wakes
-  <br>
+
+  <span style="display:inline-block; width: 40px;"></span>
 
 <p align="center">
   <img width="675" height="433" alt="57_027c7e99-8ca7-4f42-9891-b02656a8beef" src="https://github.com/user-attachments/assets/d7605f8c-a67a-4085-bad1-ff615fb1fb60" />
 </p>
+<span style="display:inline-block; width: 40px;"></span>
 
 ## Requirements
 
