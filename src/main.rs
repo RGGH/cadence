@@ -2,9 +2,14 @@
 //!
 //! Works with any sensor that exposes the standard Cycling Speed and Cadence
 //! Service (0x1816), e.g. the Saris Speed/Cadence sensor.
+//!
+//! Rides are recorded to `~/.local/share/cadence/rides.db` (see `db.rs`).
+
+mod db;
 
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -13,18 +18,21 @@ use btleplug::api::{
     bleuuid::uuid_from_u16, Central, Manager as _, Peripheral as _, ScanFilter,
 };
 use btleplug::platform::{Adapter, Manager, Peripheral};
+use chrono::{DateTime, Local};
 use futures::StreamExt;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    layout::{Alignment, Constraint, Layout},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph},
+    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Row, Table, TableState},
     DefaultTerminal, Frame,
 };
 use tokio::{sync::mpsc, time};
 use uuid::Uuid;
+
+use db::{unix_now, Db, RideStats, RideSummary, MIN_SAVED_PEDALLING_SECS};
 
 // ───────────────────────── constants ─────────────────────────
 
@@ -40,6 +48,8 @@ const TARGET_RPM: f64 = 90.0;
 /// Readings above these are treated as glitches and ignored.
 const MAX_CRANK_RPS: f64 = 250.0 / 60.0;
 const MAX_WHEEL_RPS: f64 = 20.0;
+/// How many rides the history screen loads.
+const HISTORY_LIMIT: usize = 500;
 
 // ───────────────────────── CSC parsing ─────────────────────────
 
@@ -159,6 +169,12 @@ enum Msg {
     Csc(Csc),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Live,
+    History,
+}
+
 struct App {
     wheel_circumference_m: f64,
     status: String,
@@ -178,13 +194,27 @@ struct App {
     max_speed: f64,
     last_sample: Instant,
 
+    // persistence
+    db: Option<Db>,
+    /// Row id of the ride currently being recorded.
+    ride_id: Option<i64>,
+    /// Last database problem, shown in the help line. The app keeps working
+    /// (just without saving) if the DB is unavailable.
+    db_note: Option<String>,
+
+    // history screen
+    view: View,
+    rides: Vec<RideSummary>,
+    selected: usize,
+    confirm_delete: bool,
+
     quit: bool,
 }
 
 impl App {
-    fn new(wheel_circumference_m: f64) -> Self {
+    fn new(wheel_circumference_m: f64, db: Option<Db>, db_note: Option<String>) -> Self {
         let now = Instant::now();
-        Self {
+        let mut app = Self {
             wheel_circumference_m,
             status: "Starting…".into(),
             connected: false,
@@ -200,11 +230,59 @@ impl App {
             elapsed_secs: 0,
             max_speed: 0.0,
             last_sample: now,
+            db,
+            ride_id: None,
+            db_note,
+            view: View::Live,
+            rides: Vec::new(),
+            selected: 0,
+            confirm_delete: false,
             quit: false,
+        };
+        app.begin_ride();
+        app
+    }
+
+    // ── ride recording
+
+    /// Open a new ride row in the DB (no-op without a DB).
+    fn begin_ride(&mut self) {
+        self.ride_id = None;
+        if let Some(db) = &self.db {
+            match db.start_ride(unix_now(), TARGET_RPM) {
+                Ok(id) => self.ride_id = Some(id),
+                Err(e) => self.db_note = Some(format!("can't save ride: {e:#}")),
+            }
         }
     }
 
-    fn reset_stats(&mut self) {
+    /// Close the current ride: save its totals, or discard it if it was
+    /// just someone fiddling with the sensor.
+    fn end_ride(&mut self) {
+        let Some(id) = self.ride_id.take() else { return };
+        let Some(db) = &self.db else { return };
+
+        let result = if self.pedalling_secs < MIN_SAVED_PEDALLING_SECS {
+            db.delete_ride(id)
+        } else {
+            db.finish_ride(
+                id,
+                unix_now(),
+                &RideStats {
+                    pedalling_secs: self.pedalling_secs,
+                    avg_cadence: self.avg_cadence(),
+                    max_cadence: self.max_cadence,
+                },
+            )
+        };
+        if let Err(e) = result {
+            self.db_note = Some(format!("can't save ride: {e:#}"));
+        }
+    }
+
+    /// Save the current ride and start again from zero.
+    fn new_ride(&mut self) {
+        self.end_ride();
         self.history.clear();
         self.max_cadence = 0.0;
         self.cadence_sum = 0.0;
@@ -214,7 +292,10 @@ impl App {
         self.crank.total_revs = 0;
         self.wheel.total_revs = 0;
         self.started = Instant::now();
+        self.begin_ride();
     }
+
+    // ── live numbers
 
     fn cadence(&self, now: Instant) -> f64 {
         self.crank.current(now) * 60.0
@@ -260,7 +341,8 @@ impl App {
         }
     }
 
-    /// Called once a second: record a history point and update the stats.
+    /// Called once a second: record a history point, update the stats and
+    /// write the sample to the database.
     fn sample(&mut self, now: Instant) {
         let cad = self.cadence(now);
         if self.history.len() >= WINDOW_SECS {
@@ -275,14 +357,88 @@ impl App {
             self.max_cadence = self.max_cadence.max(cad);
         }
         self.max_speed = self.max_speed.max(self.speed_kmh(now));
+
+        if let (Some(db), Some(id)) = (&self.db, self.ride_id) {
+            if let Err(e) = db.add_sample(id, self.elapsed_secs, cad) {
+                self.db_note = Some(format!("write failed: {e:#}"));
+            }
+        }
     }
 
+    // ── history screen
+
+    fn reload_rides(&mut self) {
+        match &self.db {
+            Some(db) => match db.list_rides(HISTORY_LIMIT) {
+                Ok(rides) => self.rides = rides,
+                Err(e) => self.db_note = Some(format!("can't read history: {e:#}")),
+            },
+            None => self.rides.clear(),
+        }
+        self.selected = self.selected.min(self.rides.len().saturating_sub(1));
+    }
+
+    fn open_history(&mut self) {
+        self.selected = 0;
+        self.confirm_delete = false;
+        self.reload_rides();
+        self.view = View::History;
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.rides.is_empty() {
+            return;
+        }
+        let max = (self.rides.len() - 1) as isize;
+        self.selected = (self.selected as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// First press arms the delete, second press performs it.
+    fn delete_selected(&mut self) {
+        let id = match self.rides.get(self.selected) {
+            Some(r) => r.id,
+            None => return,
+        };
+        if !self.confirm_delete {
+            self.confirm_delete = true;
+            return;
+        }
+        self.confirm_delete = false;
+        if let Some(db) = &self.db {
+            if let Err(e) = db.delete_ride(id) {
+                self.db_note = Some(format!("can't delete ride: {e:#}"));
+            }
+        }
+        self.reload_rides();
+    }
+
+    // ── input
+
     fn on_key(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
-            KeyCode::Char('r') => self.reset_stats(),
-            _ => {}
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return;
+        }
+        match self.view {
+            View::Live => match k.code {
+                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+                KeyCode::Char('r') => self.new_ride(),
+                KeyCode::Char('h') | KeyCode::Tab => self.open_history(),
+                _ => {}
+            },
+            View::History => {
+                if !matches!(k.code, KeyCode::Char('x') | KeyCode::Delete) {
+                    self.confirm_delete = false;
+                }
+                match k.code {
+                    KeyCode::Char('q') => self.quit = true,
+                    KeyCode::Esc | KeyCode::Tab | KeyCode::Char('h') => self.view = View::Live,
+                    KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+                    KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+                    KeyCode::Char('x') | KeyCode::Delete => self.delete_selected(),
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -403,6 +559,13 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
+/// Local-time date for the history list, e.g. "Fri 06 Nov  14:32".
+fn fmt_date(unix: i64) -> String {
+    DateTime::from_timestamp(unix, 0)
+        .map(|d| d.with_timezone(&Local).format("%a %d %b  %H:%M").to_string())
+        .unwrap_or_else(|| "?".into())
+}
+
 fn big(text: String, color: Color) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(color).add_modifier(Modifier::BOLD)))
 }
@@ -411,26 +574,57 @@ fn dim(text: &str) -> Line<'static> {
     Line::from(Span::styled(text.to_string(), Style::default().fg(Color::DarkGray)))
 }
 
+fn help_line(app: &App) -> Line<'static> {
+    let text = match (app.view, app.confirm_delete) {
+        (View::Live, _) => " q quit   r save & start new ride   h history",
+        (View::History, false) => " ↑/↓ select   x delete   h back   q quit",
+        (View::History, true) => " press x again to delete this ride (any other key cancels)",
+    };
+    let mut spans = vec![Span::styled(text, Style::default().fg(Color::DarkGray))];
+    if let Some(note) = &app.db_note {
+        spans.push(Span::styled(
+            format!("   ⚠ {note}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    Line::from(spans)
+}
+
 fn draw(f: &mut Frame, app: &App) {
-    let now = Instant::now();
-    let [status_area, stats_area, chart_area, help_area] = Layout::vertical([
+    let [status_area, body_area, help_area] = Layout::vertical([
         Constraint::Length(3),
-        Constraint::Length(6),
-        Constraint::Min(8),
+        Constraint::Min(14),
         Constraint::Length(1),
     ])
     .areas(f.area());
 
     // ── status bar
     let status_color = if app.connected { Color::Green } else { Color::Yellow };
+    let mut status_spans = vec![
+        Span::styled(if app.connected { "● " } else { "○ " }, Style::default().fg(status_color)),
+        Span::raw(app.status.clone()),
+    ];
+    if app.ride_id.is_some() {
+        status_spans.push(Span::styled("   ● rec", Style::default().fg(Color::DarkGray)));
+    }
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(if app.connected { "● " } else { "○ " }, Style::default().fg(status_color)),
-            Span::raw(app.status.clone()),
-        ]))
-        .block(Block::default().borders(Borders::ALL).title(" Cycling sensor ")),
+        Paragraph::new(Line::from(status_spans))
+            .block(Block::default().borders(Borders::ALL).title(" Cycling sensor ")),
         status_area,
     );
+
+    match app.view {
+        View::Live => draw_live(f, app, body_area),
+        View::History => draw_history(f, app, body_area),
+    }
+
+    f.render_widget(Paragraph::new(help_line(app)), help_area);
+}
+
+fn draw_live(f: &mut Frame, app: &App, area: Rect) {
+    let now = Instant::now();
+    let [stats_area, chart_area] =
+        Layout::vertical([Constraint::Length(6), Constraint::Min(8)]).areas(area);
 
     // ── stat panels
     let [cad_area, spd_area, ses_area] = Layout::horizontal([
@@ -536,12 +730,62 @@ fn draw(f: &mut Frame, app: &App) {
                 ]),
         );
     f.render_widget(chart, chart_area);
+}
 
-    // ── help line
-    f.render_widget(
-        Paragraph::new(dim(" q quit   r reset stats")),
-        help_area,
-    );
+fn draw_history(f: &mut Frame, app: &App, area: Rect) {
+    let total_secs: u64 = app.rides.iter().map(|r| r.duration_secs()).sum();
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " History — {} rides, {} total ",
+        app.rides.len(),
+        fmt_duration(total_secs)
+    ));
+
+    if app.rides.is_empty() {
+        let note = if app.db.is_some() {
+            format!("(rides under {MIN_SAVED_PEDALLING_SECS} s of pedalling aren't kept)")
+        } else {
+            "(the ride database couldn't be opened)".to_string()
+        };
+        f.render_widget(
+            Paragraph::new(vec![Line::from(""), dim("no saved rides yet"), dim(&note)])
+                .alignment(Alignment::Center)
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    let header = Row::new(["Date", "Length", "Pedalling", "Avg", "Max"])
+        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let rows = app.rides.iter().map(|r| {
+        Row::new(vec![
+            fmt_date(r.started_at),
+            fmt_duration(r.duration_secs()),
+            fmt_duration(r.pedalling_secs),
+            format!("{:.0} rpm", r.avg_cadence),
+            format!("{:.0} rpm", r.max_cadence),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(17),
+            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ],
+    )
+    .header(header)
+    .column_spacing(2)
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+    .highlight_symbol("▶ ")
+    .block(block);
+
+    let mut state = TableState::default().with_selected(Some(app.selected));
+    f.render_stateful_widget(table, area, &mut state);
 }
 
 // ───────────────────────── main loop ─────────────────────────
@@ -578,6 +822,9 @@ async fn run(
         }
         terminal.draw(|f| draw(f, &app))?;
     }
+
+    // Normal exit: save the ride. (After a crash, Db::open recovers it.)
+    app.end_ride();
     Ok(())
 }
 
@@ -587,16 +834,23 @@ const USAGE: &str = "\
 cadence — live dashboard for BLE cycling speed/cadence sensors
 
 USAGE:
-    cadence [--wheel-mm <millimetres>]
+    cadence [--wheel-mm <millimetres>] [--db <path>]
 
 OPTIONS:
     --wheel-mm <mm>   Wheel circumference for speed/distance (default 2105,
                       i.e. 700x25c). See the table on any tyre manufacturer's site.
+    --db <path>       Ride database (default ~/.local/share/cadence/rides.db)
     -h, --help        Show this help
 ";
 
-fn parse_args() -> Result<f64> {
+struct Args {
+    wheel_m: f64,
+    db_path: Option<PathBuf>,
+}
+
+fn parse_args() -> Result<Args> {
     let mut wheel_mm = 2105.0_f64;
+    let mut db_path = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -614,18 +868,33 @@ fn parse_args() -> Result<f64> {
                     bail!("--wheel-mm {wheel_mm} doesn't look like a wheel circumference");
                 }
             }
+            "--db" => {
+                db_path = Some(PathBuf::from(
+                    args.next().ok_or_else(|| anyhow!("--db needs a path"))?,
+                ));
+            }
             other => bail!("unknown argument `{other}`\n\n{USAGE}"),
         }
     }
-    Ok(wheel_mm / 1000.0)
+    Ok(Args { wheel_m: wheel_mm / 1000.0, db_path })
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let wheel_m = parse_args()?;
+    let args = parse_args()?;
 
     // Do this before touching the terminal so errors print normally.
     let adapter = get_adapter().await?;
+
+    // A broken database shouldn't stop you riding — just run without saving.
+    let opened = match &args.db_path {
+        Some(p) => Db::open(p),
+        None => Db::open_default(),
+    };
+    let (db, db_note) = match opened {
+        Ok(db) => (Some(db), None),
+        Err(e) => (None, Some(format!("rides won't be saved: {e:#}"))),
+    };
 
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let (key_tx, key_rx) = mpsc::unbounded_channel();
@@ -633,7 +902,7 @@ async fn main() -> Result<()> {
     spawn_input(key_tx);
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, App::new(wheel_m), msg_rx, key_rx).await;
+    let result = run(&mut terminal, App::new(args.wheel_m, db, db_note), msg_rx, key_rx).await;
     ratatui::restore();
 
     ble.abort();
@@ -646,6 +915,25 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    fn screen_text(app: &App, w: u16, h: u16) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        t.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
+
+    /// Feed a steady 90 rpm and tick `secs` samples.
+    fn pedal(app: &mut App, secs: u64) {
+        let now = Instant::now();
+        app.on_msg(Msg::Csc(Csc { wheel: None, crank: Some((0, 0)) }), now);
+        app.on_msg(
+            Msg::Csc(Csc { wheel: None, crank: Some((3, 2048)) }),
+            now + Duration::from_secs(2),
+        );
+        for _ in 0..secs {
+            app.sample(now + Duration::from_secs(2));
+        }
+    }
 
     #[test]
     fn parses_crank_only_packet() {
@@ -723,25 +1011,62 @@ mod tests {
 
     #[test]
     fn ui_renders_without_panicking() {
-        let mut app = App::new(2.105);
-        let now = Instant::now();
-        app.on_msg(Msg::Status { text: "Connected: Saris CS".into(), connected: true }, now);
-        app.on_msg(Msg::Csc(Csc { wheel: None, crank: Some((0, 0)) }), now);
+        let mut app = App::new(2.105, None, None);
         app.on_msg(
-            Msg::Csc(Csc { wheel: None, crank: Some((3, 2048)) }),
-            now + Duration::from_secs(2),
+            Msg::Status { text: "Connected: Saris CS".into(), connected: true },
+            Instant::now(),
         );
-        for i in 0..5 {
-            app.sample(now + Duration::from_secs(2) + Duration::from_millis(i * 10));
-        }
+        pedal(&mut app, 5);
         for size in [(100, 30), (60, 20), (20, 8)] {
             let mut t = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
             t.draw(|f| draw(f, &app)).unwrap();
         }
         // cadence 90 rpm should appear on a normal-size screen
-        let mut t = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        t.draw(|f| draw(f, &app)).unwrap();
-        let text: String = t.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        let text = screen_text(&app, 100, 30);
         assert!(text.contains("90 rpm"), "buffer:\n{text}");
+    }
+
+    #[test]
+    fn short_rides_are_not_saved() {
+        let mut app = App::new(2.105, Some(Db::open_in_memory().unwrap()), None);
+        pedal(&mut app, 3); // under MIN_SAVED_PEDALLING_SECS
+        app.end_ride();
+        app.open_history();
+        assert!(app.rides.is_empty());
+    }
+
+    #[test]
+    fn ride_is_saved_and_shows_in_history() {
+        let mut app = App::new(2.105, Some(Db::open_in_memory().unwrap()), None);
+        pedal(&mut app, 12);
+        assert!(app.ride_id.is_some());
+
+        // `r` saves this ride and starts a fresh one
+        app.new_ride();
+        assert_eq!(app.elapsed_secs, 0);
+        assert!(app.ride_id.is_some());
+
+        app.open_history();
+        assert_eq!(app.rides.len(), 1);
+        assert_eq!(app.rides[0].pedalling_secs, 12);
+        assert!((app.rides[0].avg_cadence - 90.0).abs() < 0.01);
+
+        let text = screen_text(&app, 100, 30);
+        assert!(text.contains("History"), "buffer:\n{text}");
+        assert!(text.contains("90 rpm"), "buffer:\n{text}");
+    }
+
+    #[test]
+    fn delete_needs_two_presses() {
+        let mut app = App::new(2.105, Some(Db::open_in_memory().unwrap()), None);
+        pedal(&mut app, 12);
+        app.new_ride();
+        app.open_history();
+        assert_eq!(app.rides.len(), 1);
+
+        app.delete_selected(); // arms
+        assert_eq!(app.rides.len(), 1);
+        app.delete_selected(); // deletes
+        assert!(app.rides.is_empty());
     }
 }
