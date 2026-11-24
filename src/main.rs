@@ -4,8 +4,10 @@
 //! Service (0x1816), e.g. the Saris Speed/Cadence sensor.
 //!
 //! Rides are recorded to `~/.local/share/cadence/rides.db` (see `db.rs`).
+//! `--gui` swaps the terminal UI for a 3D browser dashboard (see `web.rs`).
 
 mod db;
+mod web;
 
 use std::{
     collections::VecDeque,
@@ -834,23 +836,33 @@ const USAGE: &str = "\
 cadence — live dashboard for BLE cycling speed/cadence sensors
 
 USAGE:
-    cadence [--wheel-mm <millimetres>] [--db <path>]
+    cadence [--wheel-mm <millimetres>] [--db <path>] [--gui [--port <n>] [--no-open]]
 
 OPTIONS:
     --wheel-mm <mm>   Wheel circumference for speed/distance (default 2105,
                       i.e. 700x25c). See the table on any tyre manufacturer's site.
     --db <path>       Ride database (default ~/.local/share/cadence/rides.db)
+    --gui             3D browser dashboard (9-mile loop, speed follows your
+                      cadence) instead of the terminal UI
+    --port <n>        Port for --gui (default 8787)
+    --no-open         With --gui, don't launch a browser automatically
     -h, --help        Show this help
 ";
 
 struct Args {
     wheel_m: f64,
     db_path: Option<PathBuf>,
+    gui: bool,
+    port: u16,
+    open_browser: bool,
 }
 
 fn parse_args() -> Result<Args> {
     let mut wheel_mm = 2105.0_f64;
     let mut db_path = None;
+    let mut gui = false;
+    let mut port = 8787_u16;
+    let mut open_browser = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -873,10 +885,19 @@ fn parse_args() -> Result<Args> {
                     args.next().ok_or_else(|| anyhow!("--db needs a path"))?,
                 ));
             }
+            "--gui" => gui = true,
+            "--no-open" => open_browser = false,
+            "--port" => {
+                port = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--port needs a value"))?
+                    .parse()
+                    .context("--port must be a number (1-65535)")?;
+            }
             other => bail!("unknown argument `{other}`\n\n{USAGE}"),
         }
     }
-    Ok(Args { wheel_m: wheel_mm / 1000.0, db_path })
+    Ok(Args { wheel_m: wheel_mm / 1000.0, db_path, gui, port, open_browser })
 }
 
 #[tokio::main]
@@ -897,13 +918,19 @@ async fn main() -> Result<()> {
     };
 
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-    let (key_tx, key_rx) = mpsc::unbounded_channel();
     let ble = tokio::spawn(ble_task(adapter, msg_tx));
-    spawn_input(key_tx);
+    let app = App::new(args.wheel_m, db, db_note);
 
-    let mut terminal = ratatui::init();
-    let result = run(&mut terminal, App::new(args.wheel_m, db, db_note), msg_rx, key_rx).await;
-    ratatui::restore();
+    let result = if args.gui {
+        web::run(app, msg_rx, args.port, args.open_browser).await
+    } else {
+        let (key_tx, key_rx) = mpsc::unbounded_channel();
+        spawn_input(key_tx);
+        let mut terminal = ratatui::init();
+        let result = run(&mut terminal, app, msg_rx, key_rx).await;
+        ratatui::restore();
+        result
+    };
 
     ble.abort();
     result

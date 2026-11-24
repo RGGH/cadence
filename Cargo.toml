@@ -9,7 +9,7 @@ anyhow = "1"
 btleplug = "0.11"
 futures = "0.3"
 ratatui = "0.29"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 uuid = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 directories = "5"

@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cadence</title>
+<style>
+:root{--ink:#f6f2e7;--zone:#8a949b;--stopped:#8a949b;--low:#ff6b5e;--steady:#ffd25e;--target:#5be08a;--spin:#5fd3ff}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#9db8c8}
+body{font-family:"CaskaydiaCove Nerd Font","CaskaydiaCove NF","Caskaydia Cove","Caskaydia Cove Nerd Font","Cascadia Code",ui-monospace,monospace;color:var(--ink);text-shadow:0 1px 8px rgba(0,0,0,.6);font-variant-numeric:tabular-nums}
+canvas{display:block;width:100%;height:100%}
+.hud{position:fixed;pointer-events:none}
+.big{font-size:clamp(28px,4.4vw,56px);font-weight:700;line-height:1}
+.mid{font-size:clamp(18px,2.2vw,28px);font-weight:600;margin-top:14px;line-height:1}
+.lab{font-size:13px;opacity:.8;margin-top:4px}
+small{font-size:.45em;font-weight:500;opacity:.85}
+#timeBox{left:24px;top:20px}
+#spdBox{right:24px;top:20px;text-align:right}
+#status{top:14px;left:50%;transform:translateX(-50%);font-size:13px;opacity:.9;text-align:center;max-width:40vw}
+#gauge{left:50%;bottom:34px;transform:translateX(-50%);width:clamp(170px,22vw,250px);aspect-ratio:1}
+#gauge svg{width:100%;height:100%;filter:drop-shadow(0 2px 10px rgba(0,0,0,.45))}
+#gauge .disc{fill:rgba(12,18,22,.45)}
+#gauge .track{fill:none;stroke:rgba(255,255,255,.2);stroke-width:11;stroke-linecap:round}
+#gauge .val{fill:none;stroke:var(--zone);stroke-width:11;stroke-linecap:round;transition:stroke .3s}
+#gauge .tick{stroke:#fff;stroke-width:3}
+#rpm{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding-bottom:6%}
+#rpm b{font-size:clamp(44px,6.4vw,76px);line-height:1;color:var(--zone);transition:color .3s}
+#rpm span{font-size:13px;opacity:.85;margin-top:2px}
+#hint{left:24px;bottom:16px;font-size:12px;opacity:.7}
+#bar{position:fixed;left:0;right:0;bottom:0;height:4px;background:rgba(0,0,0,.25)}
+#bar i{display:block;height:100%;width:0;background:var(--zone)}
+</style>
+</head>
+<body>
+<div class="hud" id="timeBox">
+  <div class="big" id="dur">00:00</div><div class="lab">ride time</div>
+  <div class="mid" id="ped">00:00</div><div class="lab">pedalling</div>
+</div>
+<div class="hud" id="spdBox">
+  <div class="big"><span id="mph">0.0</span><small> mph</small></div><div class="lab">speed</div>
+  <div class="mid"><span id="mi">0.00</span><small> of 9.00 mi</small></div><div class="lab" id="lap">lap 1</div>
+</div>
+<div class="hud" id="status">Connecting…</div>
+<div class="hud" id="gauge">
+  <svg viewBox="0 0 220 220">
+    <circle class="disc" cx="110" cy="110" r="108"/>
+    <circle class="track" cx="110" cy="110" r="90" stroke-dasharray="424.1 565.5" transform="rotate(135 110 110)"/>
+    <circle class="val" id="arc" cx="110" cy="110" r="90" stroke-dasharray="424.1 565.5" stroke-dashoffset="424.1" transform="rotate(135 110 110)"/>
+    <line class="tick" x1="76" x2="102" y1="0" y2="0" transform="translate(110 110) rotate(337.5) translate(0 0)"/>
+  </svg>
+  <div id="rpm"><b id="cad">0</b><span>rpm</span></div>
+</div>
+<div class="hud" id="hint">↑ ↓ pedal without a sensor &nbsp; [ ] gear <span id="gear">6.2</span> m/rev &nbsp; f fullscreen</div>
+<div id="bar"><i id="barfill"></i></div>
+
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+
+const MILE = 1609.344, LOOP = 9 * MILE, ROAD_W = 6;
+function mulberry(a){return()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+const R = mulberry(7);
+const hash = (x,y)=>{const s=Math.sin(x*127.1+y*311.7)*43758.5453;return s-Math.floor(s)};
+const vn = (x,y)=>{const i=Math.floor(x),j=Math.floor(y);let fx=x-i,fy=y-j;fx=fx*fx*(3-2*fx);fy=fy*fy*(3-2*fy);
+  const a=hash(i,j),b=hash(i+1,j),c=hash(i,j+1),d=hash(i+1,j+1);return a+(b-a)*fx+(c-a)*fy+(a-b-c+d)*fx*fy};
+
+// ── renderer / scene
+const renderer = new THREE.WebGLRenderer({antialias:true, logarithmicDepthBuffer:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 0.95;
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0xcbdbe4, 0.00055);
+const camera = new THREE.PerspectiveCamera(72, 1, 0.1, 9000);
+scene.add(camera);
+
+// ── the 9-mile loop (closed spline, scaled to exactly 9 miles, dead flat)
+const K = 26, pts = [];
+for (let k=0;k<K;k++){const a=k/K*Math.PI*2, r=1+.22*Math.sin(2*a+1)+.12*Math.sin(3*a+2)+(R()-.5)*.14;
+  pts.push(new THREE.Vector3(Math.cos(a)*r*1.35,0,Math.sin(a)*r));}
+let curve = new THREE.CatmullRomCurve3(pts,true,'centripetal'); curve.arcLengthDivisions = 20000;
+const sc = LOOP / curve.getLength();
+curve = new THREE.CatmullRomCurve3(pts.map(p=>p.clone().multiplyScalar(sc)),true,'centripetal'); curve.arcLengthDivisions = 20000;
+const P = new THREE.Vector3(), T = new THREE.Vector3();
+function frame(s){const u=(((s%LOOP)+LOOP)%LOOP)/LOOP; curve.getPointAt(u,P); curve.getTangentAt(u,T);
+  const l=Math.hypot(T.x,T.z); const tx=T.x/l, tz=T.z/l; return {x:P.x,z:P.z,tx,tz,lx:tz,lz:-tx}}
+
+// ── procedural tarmac (aggregate, wheel tracks, cracks, worn markings) + bump
+function tarmac(){
+  const S=1024,c=document.createElement('canvas');c.width=c.height=S;const g=c.getContext('2d');
+  const im=g.createImageData(S,S),d=im.data;
+  for(let y=0;y<S;y++)for(let x=0;x<S;x++){
+    const u=x/S, w=Math.exp(-((u-.3)**2)/.004)+Math.exp(-((u-.7)**2)/.004), e=Math.exp(-(u*u)/.002)+Math.exp(-((1-u)**2)/.002);
+    const v=60-w*13+e*10+(R()-.5)*30+(R()<.04?R()*55:0)-(R()<.02?24:0), i=(y*S+x)*4;
+    d[i]=v*.98;d[i+1]=v;d[i+2]=v*1.04;d[i+3]=255;}
+  g.putImageData(im,0,0);
+  for(let n=0;n<16000;n++){const l=R()<.55?70+R()*75:18+R()*22;
+    g.fillStyle=`rgba(${l},${l},${l*1.03},${.35+R()*.45})`;g.beginPath();g.ellipse(R()*S,R()*S,.8+R()*2.4,.7+R()*2,R()*3,0,7);g.fill();}
+  g.strokeStyle='rgba(12,12,14,.6)';g.lineWidth=1.3;
+  for(let n=0;n<7;n++){g.beginPath();let x=R()*S,y=R()*S;g.moveTo(x,y);for(let j=0;j<34;j++){x+=(R()-.5)*26;y+=R()*14;g.lineTo(x,y)}g.stroke();}
+  g.fillStyle='rgba(222,222,212,.85)';
+  g.fillRect(38,0,14,S);g.fillRect(S-52,0,14,S);g.fillRect(S/2-7,0,14,340);
+  for(let n=0;n<4500;n++){const x=[45,S-45,S/2][n%3]+(R()-.5)*20,y=R()*S;g.fillStyle=`rgba(40,40,42,${.3+R()*.5})`;g.fillRect(x,y,1+R()*3,1+R()*3);}
+  const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;t.wrapT=THREE.RepeatWrapping;
+  t.anisotropy=renderer.capabilities.getMaxAnisotropy();return t;}
+const roadMap = tarmac();
+
+const N = Math.ceil(LOOP/2), pos = new Float32Array((N+1)*6), uv = new Float32Array((N+1)*4), idx = [];
+for(let i=0;i<=N;i++){const s=i/N*LOOP,f=frame(s),h=ROAD_W/2;
+  pos.set([f.x+f.lx*h,0,f.z+f.lz*h,f.x-f.lx*h,0,f.z-f.lz*h],i*6); uv.set([0,s/ROAD_W,1,s/ROAD_W],i*4);
+  if(i<N){const a=i*2;idx.push(a,a+1,a+2,a+1,a+3,a+2);}}
+const rg = new THREE.BufferGeometry();
+rg.setAttribute('position',new THREE.BufferAttribute(pos,3)); rg.setAttribute('uv',new THREE.BufferAttribute(uv,2));
+rg.setIndex(idx); rg.computeVertexNormals();
+const road = new THREE.Mesh(rg,new THREE.MeshStandardMaterial({map:roadMap,bumpMap:roadMap,bumpScale:2.2,roughness:.93,
+  polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-2}));
+road.receiveShadow = true; scene.add(road);
+
+// ── countryside: patchwork pasture/crops, grass detail
+function grassTex(){const S=512,c=document.createElement('canvas');c.width=c.height=S;const g=c.getContext('2d');
+  g.fillStyle='#b9c4a6';g.fillRect(0,0,S,S);
+  for(let n=0;n<30000;n++){const l=150+R()*100|0;g.strokeStyle=`rgba(${l*.8},${l},${l*.6},.5)`;const x=R()*S,y=R()*S;
+    g.beginPath();g.moveTo(x,y);g.lineTo(x+(R()-.5)*4,y-2-R()*5);g.stroke();}
+  const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;t.wrapS=t.wrapT=THREE.RepeatWrapping;
+  t.repeat.set(4000,4000);t.anisotropy=8;return t;}
+const SIZE=24000, SEG=300, gg=new THREE.PlaneGeometry(SIZE,SIZE,SEG,SEG); gg.rotateX(-Math.PI/2);
+const fields=[[.30,.46,.16],[.38,.55,.20],[.62,.58,.24],[.52,.52,.18],[.25,.40,.14]].map(c=>new THREE.Color(c[0],c[1],c[2]).convertSRGBToLinear());
+const gp=gg.attributes.position, col=new Float32Array(gp.count*3), cc=new THREE.Color();
+for(let i=0;i<gp.count;i++){const x=gp.getX(i),z=gp.getZ(i);
+  cc.copy(fields[Math.floor(hash(Math.floor(x/320),Math.floor(z/320))*fields.length)]).lerp(fields[1],.35)
+    .multiplyScalar(.85+vn(x/90,z/90)*.3); col.set([cc.r,cc.g,cc.b],i*3);}
+gg.setAttribute('color',new THREE.BufferAttribute(col,3));
+const ground = new THREE.Mesh(gg,new THREE.MeshStandardMaterial({map:grassTex(),vertexColors:true,roughness:1}));
+ground.position.y=-.05; ground.receiveShadow=true; scene.add(ground);
+
+// ── hedges and trees
+function leafTex(){const S=256,c=document.createElement('canvas');c.width=c.height=S;const g=c.getContext('2d');
+  g.fillStyle='#4a6a2a';g.fillRect(0,0,S,S);
+  for(let n=0;n<5000;n++){const l=R();g.fillStyle=`rgb(${30+l*60|0},${60+l*90|0},${15+l*35|0})`;g.beginPath();g.arc(R()*S,R()*S,1+R()*4,0,7);g.fill();}
+  const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;return t;}
+const leaf = leafTex(), dummy = new THREE.Object3D(), tint = new THREE.Color();
+function instanced(geo,mat,items,fn){const m=new THREE.InstancedMesh(geo,mat,items.length);
+  items.forEach((it,i)=>{fn(it);dummy.updateMatrix();m.setMatrixAt(i,dummy.matrix);});
+  m.instanceMatrix.needsUpdate=true;m.castShadow=m.receiveShadow=true;m.frustumCulled=false;scene.add(m);return m;}
+
+const hedgeList=[];
+for(let s=0;s<LOOP;s+=7)for(const side of[-1,1]){
+  if(vn(s/150,side*9.3+20)<.36||R()<.1)continue;
+  hedgeList.push({s:s+R()*2,off:side*(4.5+R()*1.7),h:1+R()*.9,w:1+R()*.5,len:6.4+R()*1.6});}
+const hg=new THREE.BoxGeometry(1,1,1);hg.translate(0,.5,0);
+const hm=instanced(hg,new THREE.MeshStandardMaterial({map:leaf,roughness:1}),hedgeList,h=>{
+  const f=frame(h.s);dummy.position.set(f.x+f.lx*h.off,0,f.z+f.lz*h.off);dummy.rotation.set(0,Math.atan2(f.tx,f.tz),0);dummy.scale.set(h.w,h.h,h.len);});
+hedgeList.forEach((h,i)=>hm.setColorAt(i,tint.setHSL(.24+R()*.06,.4,.7+R()*.3)));
+
+const treeList=[];
+for(let n=0;n<1400;n++){const side=R()<.5?-1:1;treeList.push({s:R()*LOOP,off:side*(9+R()**2*160),r:2.8+R()*2.8,h:2.2+R()*1.8,rot:R()*6});}
+const tg=new THREE.CylinderGeometry(.18,.3,1,7);tg.translate(0,.5,0);
+instanced(tg,new THREE.MeshStandardMaterial({color:0x4b3a2a,roughness:1}),treeList,t=>{
+  const f=frame(t.s);dummy.position.set(f.x+f.lx*t.off,0,f.z+f.lz*t.off);dummy.rotation.set(0,0,0);dummy.scale.set(t.r/4,t.h+t.r*.6,t.r/4);});
+const cm=instanced(new THREE.IcosahedronGeometry(1,1),new THREE.MeshStandardMaterial({map:leaf,roughness:1,flatShading:true}),treeList,t=>{
+  const f=frame(t.s);dummy.position.set(f.x+f.lx*t.off,t.h+t.r*.55,f.z+f.lz*t.off);dummy.rotation.set(0,t.rot,0);dummy.scale.set(t.r,t.r*.85,t.r);});
+treeList.forEach((t,i)=>cm.setColorAt(i,tint.setHSL(.2+R()*.1,.45,.6+R()*.4)));
+
+// ── sky (gradient, sun, procedural clouds) and light
+const sunDir = new THREE.Vector3(.55,.4,.5).normalize();
+const sky = new THREE.Mesh(new THREE.SphereGeometry(6000,32,16),new THREE.ShaderMaterial({side:THREE.BackSide,depthWrite:false,depthTest:false,fog:false,
+  uniforms:{sun:{value:sunDir}},
+  vertexShader:`varying vec3 d;void main(){d=normalize(position);gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`,
+  fragmentShader:`varying vec3 d;uniform vec3 sun;
+  float h(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+  float n(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(h(i),h(i+vec2(1,0)),f.x),mix(h(i+vec2(0,1)),h(i+vec2(1,1)),f.x),f.y);}
+  float fbm(vec2 p){float a=.5,s=0.;for(int i=0;i<5;i++){s+=a*n(p);p*=2.03;a*=.5;}return s;}
+  void main(){float y=max(d.y,0.);vec3 c=mix(vec3(.80,.87,.91),vec3(.22,.45,.78),pow(y,.5));
+    float sd=max(dot(normalize(d),sun),0.);c+=vec3(1.,.8,.5)*(pow(sd,700.)*2.+pow(sd,8.)*.22);
+    if(d.y>0.){vec2 p=d.xz/(d.y+.25)*1.5;float cl=smoothstep(.5,.82,fbm(p+3.));c=mix(c,vec3(1.),cl*.85*smoothstep(0.,.12,d.y));}
+    gl_FragColor=vec4(c,1.);
+    #include <tonemapping_fragment>
+    #include <colorspace_fragment>
+  }`}));
+sky.renderOrder=-1; sky.frustumCulled=false; scene.add(sky);
+scene.add(new THREE.HemisphereLight(0xbcd6ff,0x55633a,1.0));
+const sun = new THREE.DirectionalLight(0xffe0b0,3); sun.castShadow=true; sun.shadow.mapSize.set(2048,2048);
+Object.assign(sun.shadow.camera,{left:-90,right:90,top:90,bottom:-90,near:1,far:900});
+sun.shadow.bias=-.0004; sun.shadow.normalBias=.3; scene.add(sun,sun.target);
+
+// ── handlebars and front tyre seen from the saddle
+const rubber=new THREE.MeshStandardMaterial({color:0x111213,roughness:.85}), carbon=new THREE.MeshStandardMaterial({color:0x17181a,roughness:.45,metalness:.35});
+const bar=new THREE.Mesh(new THREE.CylinderGeometry(.012,.012,.42,12),carbon);bar.rotation.z=Math.PI/2;bar.position.set(0,-.24,-.42);
+const hoodL=new THREE.Mesh(new THREE.BoxGeometry(.04,.045,.13),carbon),hoodR=hoodL.clone();hoodL.position.set(-.2,-.235,-.5);hoodR.position.set(.2,-.235,-.5);
+const stem=new THREE.Mesh(new THREE.BoxGeometry(.045,.035,.1),carbon);stem.position.set(0,-.245,-.47);
+const tyre=new THREE.Mesh(new THREE.TorusGeometry(.335,.013,8,72),rubber);tyre.rotation.y=Math.PI/2;tyre.position.set(0,-.81,-.95);
+camera.add(bar,hoodL,hoodR,stem,tyre);
+
+// ── telemetry (SSE from the cadence binary) + keyboard stand-in
+let S={cadence:0,connected:false,elapsed:0,pedalling:0,status:'Connecting…'}, have=false;
+const es=new EventSource('/events'); es.onmessage=e=>{S=JSON.parse(e.data);have=true}; es.onerror=()=>{have=false};
+let demo=0, gear=6.2;
+addEventListener('keydown',e=>{
+  if(e.key==='ArrowUp'){demo=Math.min(130,demo+4);e.preventDefault()}
+  if(e.key==='ArrowDown'){demo=Math.max(0,demo-4);e.preventDefault()}
+  if(e.key==='[')gear=Math.max(3,gear-.4); if(e.key===']')gear=Math.min(10,gear+.4);
+  if(e.key==='f')document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen();
+  $('gear').textContent=gear.toFixed(1);});
+
+const $=id=>document.getElementById(id);
+const fmt=s=>{s=Math.floor(s);const h=s/3600|0,m=(s/60|0)%60,x=s%60,p=n=>String(n).padStart(2,'0');return h?`${h}:${p(m)}:${p(x)}`:`${p(m)}:${p(x)}`};
+const zone=r=>r<1?'stopped':r<70?'low':r<85?'steady':r<=100?'target':'spin';
+
+function resize(){renderer.setSize(innerWidth,innerHeight);camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix()}
+addEventListener('resize',resize);resize();
+
+let s=0,v=0,phase=0,cad=0,last=performance.now(),local={e:0,p:0};
+const off=1.5; // ride on the left of the lane
+function tick(now){
+  const dt=Math.min((now-last)/1000,.1);last=now;
+  const live=have&&S.connected, target=live?S.cadence:demo;
+  if(!live)demo=Math.max(0,demo-1.5*dt);
+  cad+=(target-cad)*(1-Math.exp(-dt/.35));
+  v+=(cad/60*gear-v)*(1-Math.exp(-dt/1.8));          // more rpm → faster
+  s+=v*dt; phase+=cad/60*Math.PI*2*dt;
+  if(!live){local.e+=dt;if(cad>1)local.p+=dt}
+
+  const f=frame(s),g=frame(s+14),k=Math.min(cad/90,1.3);
+  camera.position.set(f.x+f.lx*off+Math.cos(phase)*.016*k,1.15+Math.abs(Math.sin(phase))*.004*k,f.z+f.lz*off);
+  camera.lookAt(g.x+g.lx*off,1.02,g.z+g.lz*off); camera.rotateZ(Math.sin(phase)*.005*k);
+  sky.position.copy(camera.position);
+  sun.position.copy(camera.position).addScaledVector(sunDir,300); sun.target.position.copy(camera.position);
+  renderer.render(scene,camera);
+
+  const z=zone(cad), rpm=Math.round(cad);
+  document.documentElement.style.setProperty('--zone',`var(--${z})`);
+  $('cad').textContent=rpm; $('arc').style.strokeDashoffset=424.1*(1-Math.min(cad/120,1));
+  $('dur').textContent=fmt(live?S.elapsed:local.e); $('ped').textContent=fmt(live?S.pedalling:local.p);
+  $('mph').textContent=(v*2.23694).toFixed(1); $('mi').textContent=((s%LOOP)/MILE).toFixed(2);
+  $('lap').textContent='lap '+(Math.floor(s/LOOP)+1); $('barfill').style.width=((s%LOOP)/LOOP*100)+'%';
+  $('status').textContent=!have?'Waiting for the cadence server…':live?S.status:S.status+' — arrow keys pedal for you';
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
