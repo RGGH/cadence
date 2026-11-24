@@ -143,10 +143,10 @@ impl Db {
         let tx = self.conn.transaction()?;
         let ids = {
             let mut stmt = tx.prepare("SELECT id FROM rides WHERE ended_at IS NULL")?;
-            let ids = stmt
+            
+            stmt
                 .query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<i64>>>()?;
-            ids
+                .collect::<rusqlite::Result<Vec<i64>>>()?
         };
         for id in &ids {
             tx.execute(

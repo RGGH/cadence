@@ -133,7 +133,7 @@ impl Rate {
 
         let was_idle = self
             .last_event
-            .map_or(true, |t| now.duration_since(t) > IDLE_TIMEOUT);
+            .is_none_or(|t| now.duration_since(t) > IDLE_TIMEOUT);
 
         self.prev = Some((revs, time));
         self.last_event = Some(now);
@@ -360,11 +360,10 @@ impl App {
         }
         self.max_speed = self.max_speed.max(self.speed_kmh(now));
 
-        if let (Some(db), Some(id)) = (&self.db, self.ride_id) {
-            if let Err(e) = db.add_sample(id, self.elapsed_secs, cad) {
+        if let (Some(db), Some(id)) = (&self.db, self.ride_id)
+            && let Err(e) = db.add_sample(id, self.elapsed_secs, cad) {
                 self.db_note = Some(format!("write failed: {e:#}"));
             }
-        }
     }
 
     // ── history screen
@@ -406,11 +405,10 @@ impl App {
             return;
         }
         self.confirm_delete = false;
-        if let Some(db) = &self.db {
-            if let Err(e) = db.delete_ride(id) {
+        if let Some(db) = &self.db
+            && let Err(e) = db.delete_ride(id) {
                 self.db_note = Some(format!("can't delete ride: {e:#}"));
             }
-        }
         self.reload_rides();
     }
 
@@ -470,11 +468,10 @@ fn is_candidate(name: Option<&str>, services: &[Uuid]) -> bool {
 async fn find_sensor(adapter: &Adapter) -> Result<Peripheral> {
     loop {
         for p in adapter.peripherals().await? {
-            if let Some(props) = p.properties().await? {
-                if is_candidate(props.local_name.as_deref(), &props.services) {
+            if let Some(props) = p.properties().await?
+                && is_candidate(props.local_name.as_deref(), &props.services) {
                     return Ok(p);
                 }
-            }
         }
         time::sleep(Duration::from_millis(500)).await;
     }
@@ -512,13 +509,11 @@ async fn run_session(adapter: &Adapter, tx: &mpsc::UnboundedSender<Msg>) -> Resu
     status(format!("Connected: {name}"), true);
 
     while let Some(n) = notifications.next().await {
-        if n.uuid == CSC_MEASUREMENT {
-            if let Some(csc) = parse_csc(&n.value) {
-                if tx.send(Msg::Csc(csc)).is_err() {
+        if n.uuid == CSC_MEASUREMENT
+            && let Some(csc) = parse_csc(&n.value)
+                && tx.send(Msg::Csc(csc)).is_err() {
                     return Ok(()); // UI gone
                 }
-            }
-        }
     }
 
     let _ = sensor.disconnect().await;
@@ -795,11 +790,10 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
 fn spawn_input(tx: mpsc::UnboundedSender<KeyEvent>) {
     std::thread::spawn(move || {
         while let Ok(ev) = event::read() {
-            if let Event::Key(k) = ev {
-                if k.kind == KeyEventKind::Press && tx.send(k).is_err() {
+            if let Event::Key(k) = ev
+                && k.kind == KeyEventKind::Press && tx.send(k).is_err() {
                     break;
                 }
-            }
         }
     });
 }
